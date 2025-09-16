@@ -99,6 +99,53 @@ def get_hira_models(model_name="facebook/opt-1.3b", enable_checkpoint=False, loa
     return model, tokenizer, config
 
 
+def get_lora_models(model_name="facebook/opt-1.3b", enable_checkpoint=False, load_bit=16,
+                    r=8, target_modules=None, lora_alpha=32, lora_dropout=0.05, bias="none"):
+    load_params = {}
+    if load_bit == 16:
+        load_params = {'torch_dtype': torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16}
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        load_in_8bit=(load_bit == 8),
+        #         device_map='auto',
+        **load_params,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+
+    for param in model.parameters():
+        param.requires_grad = False  # freeze the model - train adapters later
+        if param.ndim == 1:
+            # cast the small parameters (e.g. layernorm) to fp32 for stability
+            param.data = param.data.to(torch.float32)
+    if enable_checkpoint:
+        model.gradient_checkpointing_enable()  # reduce number of stored activations
+    model.enable_input_require_grads()
+
+    class CastOutputToFloat(nn.Sequential):
+        def forward(self, x): return super().forward(x).to(torch.float32)
+
+    model.lm_head = CastOutputToFloat(model.lm_head)
+
+    from peft import LoraConfig, get_peft_model
+    if target_modules is not None:
+        target_modules = [module.strip() for module in target_modules.split(',')]
+    else:
+        target_modules = ["q_proj", "v_proj"]
+    config = LoraConfig(
+        r=r,
+        target_modules=target_modules,
+        bias=bias,
+        task_type="CAUSAL_LM",
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+    )
+
+    model = get_peft_model(model, config)
+    print_trainable_parameters(model)
+    return model, tokenizer, config
+
+
 def get_prefix_tuning_models(model_name="facebook/opt-1.3b", enable_checkpoint=False, load_bit=8, virtual_tokens=8):
     load_params = {}
     if load_bit == 16:
